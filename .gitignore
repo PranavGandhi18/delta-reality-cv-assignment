@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Conda
+envs/
+
+# Large binary data — committed via Git LFS or kept out of source control
+# The original Unity viewer build (~40MB UnityPlayer.so) is part of the upstream
+# assignment package and should NOT live in the repo. Users download it
+# separately and place it alongside ComputerVisionAssignment_Data/.
+UnityPlayer.so
+ComputerVisionAssignment.x86_64
+libdecor-0.so.0
+libdecor-cairo.so
+ComputerVisionAssignment_Data/Managed/
+ComputerVisionAssignment_Data/MonoBleedingEdge/
+ComputerVisionAssignment_Data/Plugins/
+ComputerVisionAssignment_Data/Resources/
+ComputerVisionAssignment_Data/*.assets
+ComputerVisionAssignment_Data/*.assets.resS
+ComputerVisionAssignment_Data/*.resS
+ComputerVisionAssignment_Data/globalgamemanagers*
+ComputerVisionAssignment_Data/level0
+ComputerVisionAssignment_Data/boot.config
+ComputerVisionAssignment_Data/app.info
+ComputerVisionAssignment_Data/RuntimeInitializeOnLoads.json
+ComputerVisionAssignment_Data/ScriptingAssemblies.json
+ComputerVisionAssignment_Data/StreamingAssets/aa/
+
+# Original input PLY point clouds (~125MB each) — kept out of git.
+# The pipeline reads them from data/original/ and writes corrected files to
+# data/output/.
+ComputerVisionAssignment_Data/StreamingAssets/Points/*.ply
+
+# Pipeline outputs (regeneratable)
+data/output/
+output/
+
+# Scratch
+scratch/
+*.log
