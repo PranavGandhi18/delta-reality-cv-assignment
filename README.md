@@ -94,10 +94,35 @@ respective camera-local frames; `traj.txt` gives the camera-to-world pose for
 each. The viewer expects every PLY to already be in *world* coordinates. On
 top of that, the source pipeline is right-handed (OpenCV / COLMAP camera
 convention) while the Unity viewer is left-handed (Y-up, Z-forward). So the
-correction is: for each point cloud, transform every point by its camera's
-cam→world matrix, then apply a handedness flip; for `traj.txt`, conjugate
-each pose through the same handedness flip. Full reasoning, including how we
-verified handedness experimentally, is in `execute_plan.md`.
+correction is, with `S_world = diag(1, 1, -1, 1)` and `S_cam = diag(1, -1, 1, 1)`:
+
+```
+p_view = S_world · T_cw · p_local            # per point cloud
+T_view = S_world · T_cw · S_cam              # per trajectory pose
+```
+
+`S_world` flips world handedness (negate Z); `S_cam` converts the camera
+frame from OpenCV (Y-down) to Unity (Y-up). Points only need `S_world`
+because they're already in source-camera coordinates; the trajectory matrix
+needs both because it terminates in a camera frame the viewer will
+interpret. Full reasoning, including how we verified handedness
+experimentally and the visual sanity checks done on macOS, is in
+[`execute_plan.md`](./execute_plan.md).
+
+## 5a. CLI knobs for fallback hypotheses
+
+If the viewer renders the scene wrong, try these without editing code:
+
+```bash
+python scripts/transform.py --flip none      # source was already LH
+python scripts/transform.py --flip y         # the up-axis is different
+python scripts/transform.py --cam-flip none  # source camera was already Y-up
+python scripts/transform.py --binary         # smaller / faster PLY output
+python scripts/transform.py --limit 100000   # smoke test on a small subset
+```
+
+`scripts/visualize.py` renders XY/XZ/YZ orthographic projections of the
+output (or `--src` for the originals) into `data/output/preview_*.png`.
 
 ## 6. References
 

@@ -229,22 +229,30 @@ choice (it's what FBX/glTF importers do under the hood) because:
 So the transformation, in compact form, is:
 
 ```
-Let S = diag(1, 1, −1, 1).                  # Z-flip in world space.
+Let S_world = diag(1,  1, -1, 1)            # Z-flip in world space.
+Let S_cam   = diag(1, -1,  1, 1)            # Y-flip in camera frame
+                                            # (see §7a for why).
+
 For each PLY (in its camera-local frame):
-    p_world_unity = S · T_cw · p_local      # bake cam→world, then flip Z.
+    p_world_unity = S_world · T_cw · p_local
+                                            # bake cam→world, then flip
+                                            # world Z. Points only care
+                                            # about the world flip.
+
 For each traj.txt pose:
-    T_unity = S · T_cw · S                  # conjugate by S.
-                                            # (S is its own inverse.)
+    T_unity = S_world · T_cw · S_cam
+                                            # left flip = world handedness
+                                            # right flip = camera convention
 ```
 
-Why the conjugation `S · T · S` for the trajectory matrix and not just
-`S · T`? Because the matrix lives in `world ← camera` space; multiplying on
-the left by `S` flips the *output* world coords, but the input (the camera
-frame) is also expressed in the same handedness. Conjugating gives a matrix
-that still represents "camera → world", but with both endpoints in the
-viewer's coordinate system. The right-multiplication by `S` reflects the
-camera's local Z axis at the same time so that the camera's stored
-look-direction stays consistent.
+Why does the trajectory matrix take a flip on *both* sides while points only
+take one? Because the matrix lives in `world ← camera` space: the left
+factor adjusts its *output* (world coordinates), and the right factor
+adjusts what it interprets as a *camera-frame* input (Unity expects
+Y-up cameras; the source encodes Y-down cameras). Points coming out of the
+PLY are already in camera frame in the source's convention, so for them we
+only need the world flip after baking — the camera convention has been
+"consumed" by the cam→world multiplication.
 
 **Alternatives we'll keep as a fallback**, in case the Z-flip doesn't render
 correctly in the viewer:
@@ -260,6 +268,57 @@ If the Z-flip doesn't look right in the viewer, `scripts/transform.py`
 accepts a `--flip {x,y,z,none}` CLI flag so the user can try alternates
 without editing code.
 
+### 7a. Why we *also* flip the camera-local Y in `traj.txt`
+
+The points are baked from camera frame into world space, so the points
+themselves don't care about camera convention. But the *trajectory matrix*
+still represents `camera → world`, and if the viewer interprets that matrix
+as a Unity-style camera pose (Y-up), an OpenCV (Y-down) input matrix would
+make the camera gizmo render upside-down or wrong-handed.
+
+Conversion from OpenCV camera frame (X right, Y down, Z forward,
+right-handed) to Unity camera frame (X right, Y up, Z forward,
+left-handed) is one Y-axis flip. So the full per-pose transformation is:
+
+```
+T_viewer = S_world · T_source · S_cam
+S_world  = diag(1,  1, -1, 1)      # world handedness fix
+S_cam    = diag(1, -1,  1, 1)      # OpenCV cam -> Unity cam
+```
+
+Both `S_world` and `S_cam` are reflections (det −1); their product has
+det +1, so `T_viewer` is still a proper rigid transform. `transform.py`
+exposes the camera flip as `--cam-flip {x,y,z,none}` (default `y`).
+
+## 7b. Sanity check on macOS (since we can't run the Linux viewer)
+
+`scripts/visualize.py` subsamples each output PLY (30k of the 2.96M
+points) and renders three orthographic projections (XY, XZ, YZ) using
+matplotlib, with camera positions overlaid as red Xs. After the full
+transformation:
+
+- **XZ view (top-down if Y is up):** All three cameras sit clustered at
+  `X ≈ 4.4, Z ≈ 1.4`. The points form a wedge opening away from the
+  cameras into the `+Z` half-space, reaching `Z ≈ 11`. That's exactly
+  the geometry expected from three forward-facing monocular reconstructions
+  taken from the same vantage point: more uncertainty / coverage at far
+  depths, ground/foreground objects close to the camera.
+- **YZ view (side view):** Cameras at `Y ≈ −3.2`; cloud Y spans roughly
+  `[−4.3, −0.4]`. So 1.1 m of cloud below the cameras (floor) and ~2.8 m
+  above (ceiling / upper walls / window region) — physically plausible
+  indoor scale.
+- **XY view (looking down −Z):** Recognisable indoor structure — what
+  looks like a dark seat / chair near the cameras, with lighter walls
+  behind. The clouds from all three images overlap in the same regions
+  where they share field-of-view, which is the strongest evidence the
+  cam→world matrices and the handedness flip are right: if either were
+  wrong, the three clouds would diverge.
+
+These checks confirm the *geometry* but cannot confirm what the Unity
+viewer specifically does with the matrix (gizmo orientation, initial
+camera pose). The user will need to launch the Linux build to confirm
+the final visual.
+
 ## 8. Output format choice (ASCII vs. binary PLY)
 
 The originals are ASCII PLY (~125 MB each, slow to load). Most PLY readers
@@ -271,3 +330,73 @@ preserve mm precision at the scene's scale and roughly match the source.
 The `transform.py` script also supports `--binary` to emit binary
 little-endian PLY for users who care more about load time than parser
 compatibility.
+
+## 9. What to do if the result looks wrong in the viewer
+
+Order of fallbacks, roughly cheapest first. All editable via CLI flags.
+
+1. **Camera gizmo upside-down but geometry correct** → drop the camera
+   flip: `python scripts/transform.py --cam-flip none`. The points are
+   placed correctly regardless of `--cam-flip`.
+2. **Whole scene mirrored / reading like a parallel universe** → try
+   `--flip none` (no handedness flip). The source might already be
+   left-handed.
+3. **Scene appears below the floor / upside-down** → try `--flip y`. This
+   swaps which axis is the world's "up" axis.
+4. **Cameras inside walls, geometry shifted** → suggests `traj.txt` is
+   actually `world→camera`, not `camera→world` (hypothesis H2 from §4).
+   Currently unsupported by the CLI — the fix would be to invert each `T`
+   before applying the rest of the pipeline.
+
+## 10. Limitations and what we *didn't* verify
+
+- **Final viewer rendering.** This machine is macOS arm64; the viewer is a
+  Linux x86_64 Unity build. We cannot launch `ComputerVisionAssignment.x86_64`
+  natively. Visual confirmation against the PDF's reference screenshot must
+  be done by the user on a Linux host.
+- **Whether the viewer uses `traj.txt` for visualisation vs. just initial
+  camera pose.** If it draws camera gizmos using the matrix's rotation,
+  then `--cam-flip y` is the right default. If it only uses the translation
+  column, the flag is a no-op.
+- **Whether the viewer's PLY parser tolerates `comment` lines in the
+  header.** Standard PLY allows them, and `plyfile` reads them back
+  without issue, but if the upstream Unity loader is a minimal hand-rolled
+  parser, comment lines could trip it. If that happens, the workaround is
+  to either drop the comments in `transform.py` (the `comments=` kwargs in
+  `write_ply_*`) or post-process with `sed`.
+- **Whether the cameras' roll component is real or a coordinate-frame
+  artefact.** The source data shows the cameras' world-space "up" axes
+  varying from `~(+0.78, -0.62)` to `~(-0.39, -0.89)` across the three
+  images, which numerically reads as the photographer rolling the camera.
+  We did not investigate whether this is intentional (legitimate roll) or
+  a residual handedness/axis mismatch we're not modeling. If the viewer's
+  rendered cameras appear visibly tilted in a way that doesn't match the
+  source photos (`image{1,2,3}.png`), revisit this.
+
+## 11. Reproduction checklist (for the reviewer)
+
+```bash
+# 1. clone the repo
+git clone <repo-url>
+cd <repo>
+
+# 2. restore the upstream package
+#    (the original PLYs + viewer binaries are .gitignored — drop the
+#    unzipped assignment package on top of the checkout)
+
+# 3. create the conda env
+conda create -n cv_assignment python=3.11 -y
+conda activate cv_assignment
+pip install numpy plyfile pillow scipy matplotlib
+
+# 4. run the transform
+python scripts/transform.py
+
+# 5. copy the outputs into the viewer's StreamingAssets
+cp data/output/image*.ply ComputerVisionAssignment_Data/StreamingAssets/Points/
+cp data/output/traj.txt   ComputerVisionAssignment_Data/StreamingAssets/
+
+# 6. (Linux only) launch the viewer
+chmod +x ComputerVisionAssignment.x86_64
+./ComputerVisionAssignment.x86_64
+```
