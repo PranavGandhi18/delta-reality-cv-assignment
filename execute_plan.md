@@ -178,3 +178,96 @@ We can't natively run that binary. We will:
   (OpenCV/right-handed → Unity/left-handed). Set up conda env
   `cv_assignment` (python 3.11, numpy, plyfile, pillow, scipy) and a git
   repo on `main`.
+
+- **2026-05-30** — Wrote `scripts/analyze.py`. Initial parse failure: I had
+  assumed `traj.txt` rows start with an image index, but they don't — that
+  was a line-number artifact from the file viewer. Fixed: rows are just 16
+  floats; image index is implicit (row N → imageN.ply). Re-ran. Findings:
+
+  - All three 3×3 rotation blocks are proper rotations (`det = +1`,
+    `‖R Rᵀ − I‖∞ < 5e-8`).
+  - PLY local Z bounds are **all strictly positive**:
+    image1 z∈[+1.42, +9.82], image2 z∈[+1.48, +2.46], image3 z∈[+1.38, +3.51].
+    That is the signature of points expressed in a **camera frame with +Z =
+    forward (away from the camera)** — i.e. OpenCV / COLMAP camera
+    convention. The PLYs are *camera-local*, not world.
+  - All three cameras are clustered tightly in world space:
+    `(3.97, −3.21, −1.45)`, `(4.52, −3.15, −1.40)`, `(4.71, −3.12, −1.40)`.
+    X spread 0.74 m, Y spread 0.09 m, Z spread 0.05 m. Consistent with one
+    person taking three shots from nearly the same spot while rotating —
+    not three different rooms.
+  - Camera `+X` axes in world have `z ≈ 0` for all three cameras
+    (`-0.010, −0.006, −0.022`). Camera `+Z` axes are all `≈ (~0, ~0, −0.99)`.
+    Interpretation: the cameras' image-right is horizontal in world space,
+    and the cameras' look-direction is along world `−Z`. That is exactly
+    what we'd expect for **world = Y-up, right-handed** with cameras shot
+    horizontally facing the world's `−Z` half-space.
+  - H1 test: applied each `T_cw` to the 8 bbox corners of the corresponding
+    local PLY. Pairwise overlap of resulting **world** bboxes:
+    `image1 ∩ image2 = 11.5`, `image1 ∩ image3 = 35.3`, `image2 ∩ image3 = 11.5`
+    cubic units. They overlap substantially → all three views share the
+    same world region → **PLYs are camera-local; H1 (apply `T_cw`) is
+    correct.**
+
+  Conclusion on source convention: **right-handed, Y-up world; OpenCV-style
+  camera frame.**
+
+## 7. Picking the source→viewer transformation
+
+The viewer is a Unity app, which uses a **left-handed Y-up** world (X right,
+Y up, Z forward). The conventional way to convert a right-handed Y-up scene
+to Unity is to **negate one of the world axes**. Negating Z is the standard
+choice (it's what FBX/glTF importers do under the hood) because:
+
+- It preserves Y as the up axis (so Y still "feels right" in the viewer).
+- It flips the handedness, which is what we need.
+- After the flip, the cameras' source `+Z = look-direction` (which mapped to
+  world `−Z` in the source) ends up mapping to world `+Z` in Unity — which
+  is exactly Unity's camera-forward axis. So cameras "naturally" look into
+  the scene in Unity after the Z flip.
+
+So the transformation, in compact form, is:
+
+```
+Let S = diag(1, 1, −1, 1).                  # Z-flip in world space.
+For each PLY (in its camera-local frame):
+    p_world_unity = S · T_cw · p_local      # bake cam→world, then flip Z.
+For each traj.txt pose:
+    T_unity = S · T_cw · S                  # conjugate by S.
+                                            # (S is its own inverse.)
+```
+
+Why the conjugation `S · T · S` for the trajectory matrix and not just
+`S · T`? Because the matrix lives in `world ← camera` space; multiplying on
+the left by `S` flips the *output* world coords, but the input (the camera
+frame) is also expressed in the same handedness. Conjugating gives a matrix
+that still represents "camera → world", but with both endpoints in the
+viewer's coordinate system. The right-multiplication by `S` reflects the
+camera's local Z axis at the same time so that the camera's stored
+look-direction stays consistent.
+
+**Alternatives we'll keep as a fallback**, in case the Z-flip doesn't render
+correctly in the viewer:
+
+- Y-flip (`S = diag(1, −1, 1, 1)`): would imply the source convention was
+  Y-down, not Y-up. The cameras' `−0.99` Z component above doesn't really
+  support that.
+- No flip at all: would mean the source was already left-handed (Unity-style)
+  and we only needed the cam→world baking. Possible but unusual for CV data.
+- X-flip: very unusual; would mean the camera was mirrored.
+
+If the Z-flip doesn't look right in the viewer, `scripts/transform.py`
+accepts a `--flip {x,y,z,none}` CLI flag so the user can try alternates
+without editing code.
+
+## 8. Output format choice (ASCII vs. binary PLY)
+
+The originals are ASCII PLY (~125 MB each, slow to load). Most PLY readers
+accept either, but custom Unity loaders are sometimes ASCII-only. To
+minimise risk of the viewer choking on our output, **we emit ASCII PLY
+matching the original layout**: `x y z r g b` per line, with `float` for
+position and `uchar` for color. We keep ~6 decimal places — enough to
+preserve mm precision at the scene's scale and roughly match the source.
+The `transform.py` script also supports `--binary` to emit binary
+little-endian PLY for users who care more about load time than parser
+compatibility.
