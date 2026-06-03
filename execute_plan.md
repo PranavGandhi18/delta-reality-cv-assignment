@@ -373,6 +373,57 @@ Order of fallbacks, roughly cheapest first. All editable via CLI flags.
   rendered cameras appear visibly tilted in a way that doesn't match the
   source photos (`image{1,2,3}.png`), revisit this.
 
+## 10a. On-Mac interactive preview (Open3D)
+
+Section 10 noted that the Linux viewer can't run on macOS. To still get
+a real visual check from this machine (rather than just the static
+matplotlib PNGs from §7b), we added an Open3D-based interactive preview:
+**`scripts/preview_o3d.py`**.
+
+Why Open3D specifically:
+- Native arm64 wheel on macOS — `pip install open3d` and done.
+- Reads ASCII PLY directly (verified: it loads our 2.96M-point output
+  cloud in a couple of seconds and downsamples to ~19k points at a 5 cm
+  voxel size without losing the recognisable scene).
+- Has a built-in interactive `draw_geometries()` window with the
+  rotate / pan / zoom controls you'd expect, so it doubles as a
+  "what would the Unity viewer probably show?" check.
+
+The script renders:
+
+- The three transformed point clouds (`data/output/image{1,2,3}.ply`),
+  voxel-downsampled to keep interaction snappy (CLI flag
+  `--downsample` controls the voxel size; `0` disables it).
+- A 5-vertex pyramid frustum at each camera pose in
+  `data/output/traj.txt`, colored red / green / blue for
+  cam1 / cam2 / cam3. The apex of each pyramid is the camera position;
+  the base sits one unit of `--frustum-size` along the camera's stored
+  `+Z` (i.e. the viewer-space look-direction). If the transform is
+  correct, all three pyramids should sit at one end of the scene
+  pointing into the room.
+- An RGB axis triad at the world origin so you can orient yourself.
+
+This is what's used as the day-to-day correctness check on this Mac.
+The reference screenshot in the assignment PDF is still the gold
+standard, but the user can already see in the Open3D window whether the
+indoor scene looks coherent (walls, furniture, ceiling roughly aligned;
+cameras clustered at one end facing into the scene) before going
+through the trouble of finding a Linux box.
+
+Limitation worth flagging: Open3D's `draw_geometries` is *not* the
+Unity viewer. Differences from the original viewer that won't be caught
+by this preview:
+
+- How the viewer initialises its own camera from `traj.txt` (we draw
+  frusta, the viewer might place the user's eye at one of those poses).
+- How the viewer parses the PLY (we use Open3D's PLY reader; the Unity
+  viewer presumably has its own).
+- Whether the viewer handles PLY `comment` header lines (Open3D does;
+  some minimal parsers don't).
+
+If the Open3D preview looks right but the Unity viewer doesn't, the
+remaining suspects are in that list, not in the coordinate math.
+
 ## 11. Reproduction checklist (for the reviewer)
 
 ```bash
@@ -387,7 +438,7 @@ cd <repo>
 # 3. create the conda env
 conda create -n cv_assignment python=3.11 -y
 conda activate cv_assignment
-pip install numpy plyfile pillow scipy matplotlib
+pip install numpy plyfile pillow scipy matplotlib open3d
 
 # 4. run the transform
 python scripts/transform.py
@@ -396,7 +447,12 @@ python scripts/transform.py
 cp data/output/image*.ply ComputerVisionAssignment_Data/StreamingAssets/Points/
 cp data/output/traj.txt   ComputerVisionAssignment_Data/StreamingAssets/
 
-# 6. (Linux only) launch the viewer
+# 6a. interactive preview from any OS (recommended)
+python scripts/preview_o3d.py
+# Use this if no Linux box is handy. Same geometry, different viewer.
+
+# 6b. (Linux only) launch the assignment's Unity viewer for the
+#     gold-standard check
 chmod +x ComputerVisionAssignment.x86_64
 ./ComputerVisionAssignment.x86_64
 ```

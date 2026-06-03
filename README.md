@@ -52,6 +52,8 @@ Pinned versions used during development:
 - plyfile 1.1.4
 - pillow 12.2.0
 - scipy 1.17.1
+- matplotlib 3.10.9 (for the static XY/XZ/YZ preview PNGs)
+- open3d 0.19.0 (for the interactive on-Mac preview window)
 
 ## 3. Run the transformation
 
@@ -65,7 +67,44 @@ This reads the original PLYs and `traj.txt` from
 coordinate-system fix described in `execute_plan.md`, and writes corrected
 copies into `data/output/`.
 
-## 4. View the result
+## 3a. Quick preview on macOS (no Linux machine needed)
+
+The supplied Unity viewer is a Linux x86_64 binary, so you can't run it
+natively on macOS. To still get a visual confirmation that the
+transformation is correct, the repo ships an interactive Open3D viewer
+that loads the same outputs the Unity viewer would, plus camera frusta
+for each pose in `traj.txt`:
+
+```bash
+conda activate cv_assignment
+python scripts/preview_o3d.py
+```
+
+This opens a window with:
+- The three transformed point clouds (RGB-colored).
+- Three camera frusta drawn in red / green / blue at the cam1 / cam2 /
+  cam3 positions, oriented along each camera's stored look-direction.
+- An RGB axis triad at the world origin.
+
+Controls (Open3D defaults): left-drag to rotate, right-drag to pan,
+scroll to zoom, `R` to reset, `H` for the full help printed to the
+terminal. The preview defaults to 2 cm voxel downsampling to stay
+responsive; pass `--downsample 0` to render every point or
+`--downsample 0.05` to render fewer.
+
+To compare against the un-transformed source instead, pass `--src`.
+
+A static (non-interactive) version of the same comparison is also
+available as PNGs:
+
+```bash
+python scripts/visualize.py            # XY / XZ / YZ projections of the output
+python scripts/visualize.py --src      # same projections, source data
+```
+
+The PNGs land in `data/output/preview_*.png`.
+
+## 4. View the result in the Delta Reality viewer (Linux only)
 
 Copy the outputs into the locations the viewer reads from:
 
@@ -82,6 +121,10 @@ cp data/output/traj.txt   ComputerVisionAssignment_Data/StreamingAssets/
 chmod +x ComputerVisionAssignment.x86_64
 ./ComputerVisionAssignment.x86_64
 ```
+
+If you don't have a Linux machine handy, use **§3a** instead — the
+Open3D preview shows the same geometry in an interactive window on macOS
+(or Windows, or any OS where Open3D runs).
 
 Viewer controls (from the assignment PDF):
 - Hold the **right mouse button** to rotate.
