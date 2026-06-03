@@ -67,6 +67,20 @@ def parse_args() -> argparse.Namespace:
         help="Length (in meters) of each camera frustum drawn for traj.txt. "
         "Default 0.4 — small enough not to obscure the scene.",
     )
+    p.add_argument(
+        "--render",
+        type=Path,
+        default=None,
+        help="If set, render the scene to this PNG file from the initial "
+        "view and exit, without opening a window. Useful when running over "
+        "ssh, on a headless host, or to grab a still for a report.",
+    )
+    p.add_argument(
+        "--no-initial-view",
+        action="store_true",
+        help="Don't override Open3D's default initial camera. Useful if the "
+        "tuned view we set looks wrong on your scene.",
+    )
     return p.parse_args()
 
 
@@ -176,17 +190,71 @@ def main() -> int:
     triad = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)
     geoms.append(triad)
 
-    # 4) Launch interactive window.
+    # 4) Compute a sensible initial view: stand a couple of meters BEHIND the
+    #    average camera position, look toward a point in front of the cameras,
+    #    keep world +Y as up. This mirrors the orientation of the reference
+    #    screenshot in the assignment PDF.
+    cam_positions = np.array([T[:3, 3] for T in poses])
+    cam_forwards = np.array([T[:3, 2] for T in poses])
+    avg_pos = cam_positions.mean(axis=0)
+    avg_fwd = cam_forwards.mean(axis=0)
+    avg_fwd /= np.linalg.norm(avg_fwd)
+    initial_eye = avg_pos - 2.5 * avg_fwd + np.array([0.0, 1.0, 0.0])
+    initial_lookat = avg_pos + 4.0 * avg_fwd
+    initial_up = np.array([0.0, 1.0, 0.0])
+    front_dir = initial_eye - initial_lookat
+    front_dir /= np.linalg.norm(front_dir)
+    initial_zoom = 0.45
+    print("initial view:")
+    print(f"  lookat = {initial_lookat.round(3).tolist()}")
+    print(f"  up     = {initial_up.tolist()}")
+    print(f"  front  = {front_dir.round(3).tolist()}")
+    print(f"  zoom   = {initial_zoom}")
+
+    # 5) Either render to PNG or open an interactive window.
+    if args.render is not None:
+        args.render.parent.mkdir(parents=True, exist_ok=True)
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(width=1280, height=800, visible=False)
+        for g in geoms:
+            vis.add_geometry(g)
+        opt = vis.get_render_option()
+        opt.background_color = np.array([0.55, 0.65, 0.78])
+        opt.point_size = 1.5
+        ctr = vis.get_view_control()
+        ctr.set_lookat(initial_lookat.tolist())
+        ctr.set_front(front_dir.tolist())
+        ctr.set_up(initial_up.tolist())
+        ctr.set_zoom(initial_zoom)
+        vis.poll_events()
+        vis.update_renderer()
+        vis.capture_screen_image(str(args.render), do_render=True)
+        vis.destroy_window()
+        print(f"\nwrote {args.render}")
+        return 0
+
     print("\nopening Open3D window — close it to exit. "
           "Press H in the window for the full controls list.")
-    o3d.visualization.draw_geometries(
-        geoms,
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(
         window_name=("delta-reality preview — "
                      f"{'source' if args.src else 'transformed'}"),
         width=1280,
         height=800,
-        point_show_normal=False,
     )
+    for g in geoms:
+        vis.add_geometry(g)
+    opt = vis.get_render_option()
+    opt.background_color = np.array([0.55, 0.65, 0.78])
+    opt.point_size = 1.5
+    if not args.no_initial_view:
+        ctr = vis.get_view_control()
+        ctr.set_lookat(initial_lookat.tolist())
+        ctr.set_front(front_dir.tolist())
+        ctr.set_up(initial_up.tolist())
+        ctr.set_zoom(initial_zoom)
+    vis.run()
+    vis.destroy_window()
     return 0
 
 
