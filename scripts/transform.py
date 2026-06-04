@@ -81,6 +81,15 @@ def parse_args() -> argparse.Namespace:
         help="Process only the first N vertices per PLY. Useful for quick "
         "smoke tests; omit for full output.",
     )
+    p.add_argument(
+        "--upright",
+        action="store_true",
+        help="After the world flip, compute the average camera 'up' axis "
+        "across the three poses and rotate the world so that average lands "
+        "on (0, 1, 0). Fixes the case where the source data's true vertical "
+        "axis is not exactly aligned with viewer Y, which manifests in the "
+        "Unity viewer as a scene you can't level-orbit to upright.",
+    )
     return p.parse_args()
 
 
@@ -92,6 +101,74 @@ def flip_matrix(flip: str) -> np.ndarray:
     idx = {"x": 0, "y": 1, "z": 2}[flip]
     S[idx, idx] = -1.0
     return S
+
+
+def axis_align_rotation(from_vec: np.ndarray, to_vec: np.ndarray) -> np.ndarray:
+    """4x4 rotation matrix that maps `from_vec` direction to `to_vec`.
+
+    Rodrigues formula. Both vectors are auto-normalised. Falls back to
+    identity if they're already aligned and to a 180° flip about an
+    arbitrary perpendicular axis if they're antiparallel.
+    """
+    a = from_vec / np.linalg.norm(from_vec)
+    b = to_vec / np.linalg.norm(to_vec)
+    v = np.cross(a, b)
+    s = float(np.linalg.norm(v))
+    c = float(np.dot(a, b))
+    if s < 1e-10:
+        if c > 0:
+            return np.eye(4)
+        # antiparallel: 180° about any axis perpendicular to a
+        perp = np.array([1.0, 0.0, 0.0])
+        if abs(a[0]) > 0.9:
+            perp = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(a, perp)
+        axis /= np.linalg.norm(axis)
+        K = np.array(
+            [
+                [0, -axis[2], axis[1]],
+                [axis[2], 0, -axis[0]],
+                [-axis[1], axis[0], 0],
+            ]
+        )
+        R3 = np.eye(3) + 2 * (K @ K)
+    else:
+        K = np.array(
+            [
+                [0, -v[2], v[1]],
+                [v[2], 0, -v[0]],
+                [-v[1], v[0], 0],
+            ]
+        )
+        R3 = np.eye(3) + K + (K @ K) * ((1 - c) / (s * s))
+    R = np.eye(4)
+    R[:3, :3] = R3
+    return R
+
+
+def compute_upright_rotation(
+    poses_after_world_flip: list[np.ndarray],
+) -> np.ndarray:
+    """Given the per-camera S_world · T_cw matrices (so the rotation 3x3 is in
+    viewer-world coords already), compute the leveling rotation that maps
+    the average camera 'up' axis (the camera frame's +Y axis after S_cam,
+    but since S_cam is applied later in transform_pose, we use the
+    OpenCV-style 'up' = -col_1 of the rotation here) to viewer (0, 1, 0).
+
+    Concretely: each pose's rotation 3x3 has column 1 = camera +Y axis in
+    viewer-world. In OpenCV camera convention that axis points DOWN in
+    image space, so 'up' = -column_1. We average across the cameras and
+    Rodrigues-rotate that average to (0, 1, 0).
+    """
+    ups = []
+    for T in poses_after_world_flip:
+        up = -T[:3, 1]   # OpenCV cam +Y is image-down; up is its negation
+        ups.append(up)
+    avg_up = np.mean(np.stack(ups, axis=0), axis=0)
+    avg_up /= np.linalg.norm(avg_up)
+    print(f"  avg camera-up axis in viewer-world: {avg_up.round(4).tolist()}")
+    R = axis_align_rotation(avg_up, np.array([0.0, 1.0, 0.0]))
+    return R
 
 
 def load_traj(path: Path) -> dict[int, np.ndarray]:
@@ -274,9 +351,24 @@ def main() -> int:
     print(f"World flip: {args.flip!r}\n{S_world}")
     print(f"Camera-frame flip (for traj.txt only): {args.cam_flip!r}\n{S_cam}\n")
 
+    # 1.5) Optional upright leveling. Compute it BEFORE loading any PLY so we
+    # have a single composed world transform `M_world = R_upright · S_world`.
+    R_upright = np.eye(4)
+
     # 1) Load source trajectories.
     poses = load_traj(traj_in)
     print(f"Loaded {len(poses)} poses from {traj_in}")
+
+    if args.upright:
+        print("\nComputing upright leveling rotation:")
+        # poses_after_world_flip[i] = S_world @ poses[i]   (3x3 part is what
+        # we use to extract the cam-up axis in viewer-world coords)
+        poses_after_world_flip = [S_world @ T for T in poses.values()]
+        R_upright = compute_upright_rotation(poses_after_world_flip)
+        print(f"  upright rotation (3x3):\n{R_upright[:3, :3].round(4)}")
+
+    # Composed world transform used for points: M_world = R_upright @ S_world.
+    M_world = R_upright @ S_world
 
     # 2) Per-image: load PLY, transform, write.
     new_poses: dict[int, np.ndarray] = {}
@@ -305,7 +397,9 @@ def main() -> int:
         )
 
         t1 = time.time()
-        xyz_world = transform_cloud(xyz, T_cw, S_world)
+        # Use the composed M_world = R_upright @ S_world so points get
+        # leveled too.
+        xyz_world = transform_cloud(xyz, T_cw, M_world)
         t_xform = time.time() - t1
         print(
             f"  transformed in {t_xform:.1f}s; "
@@ -328,7 +422,9 @@ def main() -> int:
             f"in {t_write:.1f}s"
         )
 
-        new_poses[img_id] = transform_pose(T_cw, S_world, S_cam)
+        # For traj.txt we use the SAME composed world transform on the left
+        # so cameras get leveled identically to the points.
+        new_poses[img_id] = transform_pose(T_cw, M_world, S_cam)
 
     # 3) Write transformed traj.txt.
     traj_out = out / "traj.txt"
