@@ -1,30 +1,38 @@
 """
-Convert the supplied PLY point clouds and `traj.txt` from the source
-coordinate system into the viewer's (Unity, left-handed Y-up) coordinate
-system.
+Convert the supplied PLY point clouds and `traj.txt` into the Unity viewer's
+coordinate system.
 
-Pipeline per point cloud (see execute_plan.md sec 7 for derivation):
+Pipeline (see execute_plan.md sec 13 for the full derivation and history of
+what we tried before):
 
-    p_world_source = T_cw · p_local                 # bake cam->world
-    p_world_viewer = S · p_world_source             # handedness flip
-                                                    # default S = diag(1, 1, -1, 1)
+    S       = diag(1, 1, -1)                # flip Z so cam-forward becomes
+                                            # Unity-forward (+Z)
+    delta   = -(S @ cam_anchor_world_pos)   # translate so the anchor
+                                            # camera lands at world origin
 
-And per trajectory pose:
+    For each point in image_i.ply:
+        p_view = S @ T_cw_i @ p_local + delta
 
-    T_viewer = S · T_cw · S                         # conjugate by S
+    For each trajectory pose T_i (4x4):
+        T_i_view = T_translate(delta) @ S_world @ T_i
+            where S_world = diag(1, 1, -1, 1)
+                  T_translate is a 4x4 translation by delta
 
-`--flip x|y|z|none` lets the user try alternates. `--ascii / --binary`
-toggles the output PLY format (default ascii, matching the source).
+The anchor camera defaults to cam2 (middle photo, smallest roll); pass
+`--center-on cam1` or `cam3` if cam2's natural roll looks wrong in the
+viewer.
 
 Run (from repo root):
     python scripts/transform.py
+    python scripts/transform.py --binary           # smaller binary PLY
+    python scripts/transform.py --center-on cam1   # try a different anchor
+    python scripts/transform.py --limit 100000     # smoke test on a subset
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import struct
 import sys
 import time
 from pathlib import Path
@@ -53,26 +61,19 @@ def parse_args() -> argparse.Namespace:
         help=f"Output directory. Default: {DEFAULT_OUT}",
     )
     p.add_argument(
-        "--flip",
-        choices=("x", "y", "z", "none"),
-        default="z",
-        help="Which world axis to negate when converting RH source -> LH "
-        "Unity viewer. Default: z.",
-    )
-    p.add_argument(
-        "--cam-flip",
-        choices=("x", "y", "z", "none"),
-        default="y",
-        help="Which camera-local axis to negate when converting the "
-        "trajectory matrix from source camera convention (OpenCV: Y-down) "
-        "to viewer camera convention (Unity: Y-up). Only affects "
-        "traj.txt, not the point cloud transform. Default: y.",
+        "--center-on",
+        choices=("cam1", "cam2", "cam3"),
+        default="cam2",
+        help="Which camera's transformed pose to drop at the world origin. "
+        "Unity's default user camera spawns near origin looking +Z, so the "
+        "anchor camera defines what the user will see when the viewer "
+        "opens. cam2 has the smallest natural roll, so it's the default.",
     )
     p.add_argument(
         "--binary",
         action="store_true",
-        help="Emit binary little-endian PLY (faster, smaller). "
-        "Default is ASCII to match source format exactly.",
+        help="Emit binary little-endian PLY (smaller / faster). Default is "
+        "ASCII to match the source format exactly.",
     )
     p.add_argument(
         "--limit",
@@ -81,101 +82,14 @@ def parse_args() -> argparse.Namespace:
         help="Process only the first N vertices per PLY. Useful for quick "
         "smoke tests; omit for full output.",
     )
-    p.add_argument(
-        "--upright",
-        action="store_true",
-        help="After the world flip, compute the average camera 'up' axis "
-        "across the three poses and rotate the world so that average lands "
-        "on (0, 1, 0). Fixes the case where the source data's true vertical "
-        "axis is not exactly aligned with viewer Y, which manifests in the "
-        "Unity viewer as a scene you can't level-orbit to upright.",
-    )
     return p.parse_args()
-
-
-def flip_matrix(flip: str) -> np.ndarray:
-    """Return the 4x4 reflection matrix S for the chosen axis flip."""
-    if flip == "none":
-        return np.eye(4)
-    S = np.eye(4)
-    idx = {"x": 0, "y": 1, "z": 2}[flip]
-    S[idx, idx] = -1.0
-    return S
-
-
-def axis_align_rotation(from_vec: np.ndarray, to_vec: np.ndarray) -> np.ndarray:
-    """4x4 rotation matrix that maps `from_vec` direction to `to_vec`.
-
-    Rodrigues formula. Both vectors are auto-normalised. Falls back to
-    identity if they're already aligned and to a 180° flip about an
-    arbitrary perpendicular axis if they're antiparallel.
-    """
-    a = from_vec / np.linalg.norm(from_vec)
-    b = to_vec / np.linalg.norm(to_vec)
-    v = np.cross(a, b)
-    s = float(np.linalg.norm(v))
-    c = float(np.dot(a, b))
-    if s < 1e-10:
-        if c > 0:
-            return np.eye(4)
-        # antiparallel: 180° about any axis perpendicular to a
-        perp = np.array([1.0, 0.0, 0.0])
-        if abs(a[0]) > 0.9:
-            perp = np.array([0.0, 1.0, 0.0])
-        axis = np.cross(a, perp)
-        axis /= np.linalg.norm(axis)
-        K = np.array(
-            [
-                [0, -axis[2], axis[1]],
-                [axis[2], 0, -axis[0]],
-                [-axis[1], axis[0], 0],
-            ]
-        )
-        R3 = np.eye(3) + 2 * (K @ K)
-    else:
-        K = np.array(
-            [
-                [0, -v[2], v[1]],
-                [v[2], 0, -v[0]],
-                [-v[1], v[0], 0],
-            ]
-        )
-        R3 = np.eye(3) + K + (K @ K) * ((1 - c) / (s * s))
-    R = np.eye(4)
-    R[:3, :3] = R3
-    return R
-
-
-def compute_upright_rotation(
-    poses_after_world_flip: list[np.ndarray],
-) -> np.ndarray:
-    """Given the per-camera S_world · T_cw matrices (so the rotation 3x3 is in
-    viewer-world coords already), compute the leveling rotation that maps
-    the average camera 'up' axis (the camera frame's +Y axis after S_cam,
-    but since S_cam is applied later in transform_pose, we use the
-    OpenCV-style 'up' = -col_1 of the rotation here) to viewer (0, 1, 0).
-
-    Concretely: each pose's rotation 3x3 has column 1 = camera +Y axis in
-    viewer-world. In OpenCV camera convention that axis points DOWN in
-    image space, so 'up' = -column_1. We average across the cameras and
-    Rodrigues-rotate that average to (0, 1, 0).
-    """
-    ups = []
-    for T in poses_after_world_flip:
-        up = -T[:3, 1]   # OpenCV cam +Y is image-down; up is its negation
-        ups.append(up)
-    avg_up = np.mean(np.stack(ups, axis=0), axis=0)
-    avg_up /= np.linalg.norm(avg_up)
-    print(f"  avg camera-up axis in viewer-world: {avg_up.round(4).tolist()}")
-    R = axis_align_rotation(avg_up, np.array([0.0, 1.0, 0.0]))
-    return R
 
 
 def load_traj(path: Path) -> dict[int, np.ndarray]:
     """Load traj.txt -> {image_id (1-based): 4x4 matrix}.
 
-    Each row of the file is 16 row-major floats. The image index is
-    implicit in the row number.
+    Each non-empty line is 16 row-major floats. The image index is implicit
+    (row N corresponds to imageN.ply).
     """
     poses: dict[int, np.ndarray] = {}
     img_id = 0
@@ -193,9 +107,8 @@ def load_traj(path: Path) -> dict[int, np.ndarray]:
 
 
 def write_traj(path: Path, poses: dict[int, np.ndarray]) -> None:
-    """Write traj.txt using the same row-major 16-float layout the loader
-    consumes. We match the source's scientific-notation float format
-    (18 digits, e-notation) so any byte-level diff stays small."""
+    """Write traj.txt in the same row-major 16-floats-per-line format as
+    the source."""
     with open(path, "w") as f:
         for _, T in sorted(poses.items()):
             row = " ".join(f"{v:.18e}" for v in T.reshape(-1))
@@ -203,10 +116,7 @@ def write_traj(path: Path, poses: dict[int, np.ndarray]) -> None:
 
 
 def read_ply_ascii(path: Path) -> tuple[np.ndarray, np.ndarray, int]:
-    """Read an ASCII PLY with `float x, float y, float z, uchar r, g, b`.
-
-    Returns (xyz [N,3] float32, rgb [N,3] uint8, n_vertex).
-    """
+    """Read an ASCII PLY with `float x, y, z, uchar r, g, b`."""
     with open(path) as f:
         n_vertex = None
         while True:
@@ -230,14 +140,12 @@ def read_ply_ascii(path: Path) -> tuple[np.ndarray, np.ndarray, int]:
 def write_ply_ascii(
     path: Path, xyz: np.ndarray, rgb: np.ndarray, *, comments: list[str] | None = None
 ) -> None:
-    """Write an ASCII PLY with the same property layout as the source."""
     n = xyz.shape[0]
     with open(path, "w") as f:
         f.write("ply\n")
         f.write("format ascii 1.0\n")
         if comments:
             for c in comments:
-                # PLY comments must be single-line
                 for line in c.splitlines():
                     f.write(f"comment {line}\n")
         f.write(f"element vertex {n}\n")
@@ -249,8 +157,6 @@ def write_ply_ascii(
         f.write("property uchar blue\n")
         f.write("end_header\n")
 
-        # Stream-write to avoid building one big string in memory.
-        # Match the source's ~9-digit float precision.
         chunk = 200_000
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
@@ -265,7 +171,6 @@ def write_ply_ascii(
 def write_ply_binary(
     path: Path, xyz: np.ndarray, rgb: np.ndarray, *, comments: list[str] | None = None
 ) -> None:
-    """Write a binary_little_endian PLY with the same property layout."""
     n = xyz.shape[0]
     with open(path, "wb") as f:
         f.write(b"ply\n")
@@ -283,7 +188,6 @@ def write_ply_binary(
         f.write(b"property uchar blue\n")
         f.write(b"end_header\n")
 
-        # Pack each vertex as 3f + 3B = 12 + 3 = 15 bytes.
         dt = np.dtype(
             [
                 ("x", "<f4"),
@@ -304,31 +208,47 @@ def write_ply_binary(
         f.write(arr.tobytes(order="C"))
 
 
-def transform_cloud(xyz: np.ndarray, T_cw: np.ndarray, S: np.ndarray) -> np.ndarray:
-    """Apply M = S · T_cw to Nx3 local-frame points -> Nx3 viewer-frame
-    points."""
-    M = (S @ T_cw).astype(np.float64)
+def build_world_transform(
+    poses: dict[int, np.ndarray], anchor_id: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (M_world_4x4, M_delta_translation) such that
+
+        p_view = M_world @ p_source_world + delta
+
+    where M_world is diag(1, 1, -1, 1) and delta translates the anchor
+    camera's transformed world position to the origin.
+
+    Returns both as 4x4 matrices for ease of composition.
+    """
+    S = np.diag([1.0, 1.0, -1.0, 1.0])
+    anchor_T = poses[anchor_id]
+    anchor_pos_world = anchor_T[:3, 3]
+    anchor_pos_after_flip = S[:3, :3] @ anchor_pos_world
+    delta = -anchor_pos_after_flip
+    T_delta = np.eye(4)
+    T_delta[:3, 3] = delta
+    return S, T_delta
+
+
+def transform_cloud_points(
+    xyz_local: np.ndarray, T_cw: np.ndarray, S: np.ndarray, T_delta: np.ndarray
+) -> np.ndarray:
+    """Apply the full pipeline: cam-local -> source-world -> Z-flipped ->
+    translated. Returns Nx3 float32 in viewer-world space."""
+    M = (T_delta @ S @ T_cw).astype(np.float64)
     R = M[:3, :3]
     t = M[:3, 3]
-    return (xyz.astype(np.float64) @ R.T + t).astype(np.float32)
+    return (xyz_local.astype(np.float64) @ R.T + t).astype(np.float32)
 
 
-def transform_pose(T_cw: np.ndarray, S_world: np.ndarray, S_cam: np.ndarray) -> np.ndarray:
-    """Convert a source-camera -> source-world matrix into a
-    viewer-camera -> viewer-world matrix.
-
-    T_viewer = S_world · T_cw · S_cam.
-
-    Derivation: source-world points relate to viewer-world points by
-    `p_view_w = S_world · p_src_w`, and source-camera points relate to
-    viewer-camera points by `p_src_c = S_cam · p_view_c` (S_cam is its
-    own inverse). Substituting `p_src_w = T_cw · p_src_c` and chaining
-    gives T_viewer.
-
-    Both S_world and S_cam are reflections (det -1); their product has
-    det +1, so T_viewer remains a proper rigid transform (rotation +
-    translation)."""
-    return S_world @ T_cw @ S_cam
+def transform_pose(
+    T_cw: np.ndarray, S: np.ndarray, T_delta: np.ndarray
+) -> np.ndarray:
+    """A camera pose stored in `traj.txt` lives in source-world space. We
+    apply the SAME world transform on the left so the pose ends up in
+    viewer-world. We deliberately do NOT touch the camera-local frame
+    (right side) — see execute_plan.md sec 13 for why."""
+    return T_delta @ S @ T_cw
 
 
 def main() -> int:
@@ -346,31 +266,21 @@ def main() -> int:
         print(f"ERROR: missing {points_in}", file=sys.stderr)
         return 2
 
-    S_world = flip_matrix(args.flip)
-    S_cam = flip_matrix(args.cam_flip)
-    print(f"World flip: {args.flip!r}\n{S_world}")
-    print(f"Camera-frame flip (for traj.txt only): {args.cam_flip!r}\n{S_cam}\n")
-
-    # 1.5) Optional upright leveling. Compute it BEFORE loading any PLY so we
-    # have a single composed world transform `M_world = R_upright · S_world`.
-    R_upright = np.eye(4)
-
-    # 1) Load source trajectories.
     poses = load_traj(traj_in)
     print(f"Loaded {len(poses)} poses from {traj_in}")
 
-    if args.upright:
-        print("\nComputing upright leveling rotation:")
-        # poses_after_world_flip[i] = S_world @ poses[i]   (3x3 part is what
-        # we use to extract the cam-up axis in viewer-world coords)
-        poses_after_world_flip = [S_world @ T for T in poses.values()]
-        R_upright = compute_upright_rotation(poses_after_world_flip)
-        print(f"  upright rotation (3x3):\n{R_upright[:3, :3].round(4)}")
+    anchor_id = int(args.center_on[-1])
+    if anchor_id not in poses:
+        print(f"ERROR: anchor {args.center_on!r} not in traj.txt", file=sys.stderr)
+        return 2
 
-    # Composed world transform used for points: M_world = R_upright @ S_world.
-    M_world = R_upright @ S_world
+    S, T_delta = build_world_transform(poses, anchor_id)
+    print(f"Anchor: cam{anchor_id} (source pos = {poses[anchor_id][:3,3].round(3).tolist()})")
+    print(f"Z flip + translate so cam{anchor_id} lands at world origin (0,0,0):")
+    print(f"  S      = diag(1, 1, -1)")
+    print(f"  delta  = {T_delta[:3, 3].round(3).tolist()}")
+    print()
 
-    # 2) Per-image: load PLY, transform, write.
     new_poses: dict[int, np.ndarray] = {}
     for img_id, T_cw in sorted(poses.items()):
         ply_in = points_in / f"image{img_id}.ply"
@@ -380,7 +290,7 @@ def main() -> int:
         ply_out = out / f"image{img_id}.ply"
 
         print(
-            f"\n[image{img_id}] reading {ply_in.name} "
+            f"[image{img_id}] reading {ply_in.name} "
             f"({os.path.getsize(ply_in)/1e6:.1f} MB)..."
         )
         t0 = time.time()
@@ -389,58 +299,44 @@ def main() -> int:
             xyz = xyz[: args.limit]
             rgb = rgb[: args.limit]
             n = xyz.shape[0]
-        t_read = time.time() - t0
-
-        print(
-            f"  parsed {n} verts in {t_read:.1f}s; "
-            f"local bbox = [{xyz.min(axis=0)} .. {xyz.max(axis=0)}]"
-        )
+        print(f"  parsed {n} verts in {time.time()-t0:.1f}s")
 
         t1 = time.time()
-        # Use the composed M_world = R_upright @ S_world so points get
-        # leveled too.
-        xyz_world = transform_cloud(xyz, T_cw, M_world)
-        t_xform = time.time() - t1
+        xyz_view = transform_cloud_points(xyz, T_cw, S, T_delta)
         print(
-            f"  transformed in {t_xform:.1f}s; "
-            f"viewer bbox = [{xyz_world.min(axis=0)} .. {xyz_world.max(axis=0)}]"
+            f"  transformed in {time.time()-t1:.1f}s; "
+            f"viewer bbox = [{xyz_view.min(axis=0).round(2).tolist()}"
+            f" .. {xyz_view.max(axis=0).round(2).tolist()}]"
         )
 
         comments = [
-            f"transformed by transform.py (flip={args.flip})",
+            f"transformed by transform.py (--center-on cam{anchor_id})",
             f"source = {ply_in.name}",
-            "p_viewer = S * T_cw * p_local; cam->world baked into points",
+            "p_view = T_delta @ S_z @ T_cw @ p_local",
         ]
         t2 = time.time()
         if args.binary:
-            write_ply_binary(ply_out, xyz_world, rgb, comments=comments)
+            write_ply_binary(ply_out, xyz_view, rgb, comments=comments)
         else:
-            write_ply_ascii(ply_out, xyz_world, rgb, comments=comments)
-        t_write = time.time() - t2
+            write_ply_ascii(ply_out, xyz_view, rgb, comments=comments)
         print(
             f"  wrote {ply_out} ({os.path.getsize(ply_out)/1e6:.1f} MB) "
-            f"in {t_write:.1f}s"
+            f"in {time.time()-t2:.1f}s"
         )
 
-        # For traj.txt we use the SAME composed world transform on the left
-        # so cameras get leveled identically to the points.
-        new_poses[img_id] = transform_pose(T_cw, M_world, S_cam)
+        new_poses[img_id] = transform_pose(T_cw, S, T_delta)
 
-    # 3) Write transformed traj.txt.
     traj_out = out / "traj.txt"
     write_traj(traj_out, new_poses)
     print(f"\nWrote {traj_out}")
     for img_id, T in sorted(new_poses.items()):
-        print(
-            f"  image{img_id} cam_pos (viewer space): "
-            f"{T[:3, 3].round(3).tolist()}"
-        )
+        pos = T[:3, 3].round(3).tolist()
+        fwd = T[:3, 2].round(3).tolist()
+        up = (-T[:3, 1]).round(3).tolist()  # camera up = -OpenCV+Y
+        print(f"  image{img_id}: pos={pos}  fwd={fwd}  up={up}")
 
-    print("\nDone. Copy outputs into the viewer's StreamingAssets to test:")
-    print(
-        f"  cp {out}/image*.ply "
-        f"{stream}/Points/"
-    )
+    print("\nCopy outputs into the viewer's StreamingAssets to test:")
+    print(f"  cp {out}/image*.ply {stream}/Points/")
     print(f"  cp {out}/traj.txt {stream}/")
 
     return 0

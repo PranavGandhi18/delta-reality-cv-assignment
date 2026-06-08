@@ -456,3 +456,199 @@ python scripts/preview_o3d.py
 chmod +x ComputerVisionAssignment.x86_64
 ./ComputerVisionAssignment.x86_64
 ```
+
+---
+
+## 12. Iteration history once we got an actual viewer running (Windows)
+
+The user moved to a Windows laptop and ran the supplied Unity viewer
+natively against each candidate output. This section logs every
+transform we shipped, what it looked like in the actual viewer, and
+what we learned each round. Approaches are kept here so it's clear
+*why* we ended up where we did.
+
+### Round 1 — `--flip z` only (original default)
+
+Hypothesis: source is right-handed Y-up + OpenCV camera; Unity is
+left-handed Y-up; negate world Z to flip handedness.
+
+**Math:** `p_view = diag(1,1,-1) · T_cw · p_local`; for `traj.txt`
+poses conjugate by the same matrix.
+
+**Result in Unity:** see `debug.png`. The room **renders** with sky
+above and ground below, but the entire panorama is rolled visibly to
+the right at roughly 30–50°. The user could not orbit to a level
+view. Recognisable indoor features (cabinets, red chair, wood door)
+were visible but tilted as a whole.
+
+**Why it failed:** we assumed the source's Y axis was exactly Unity's
+Y axis. It isn't — see §13 for what's really going on. So negating
+just Z left the world's *vertical* axis pointing somewhere other than
+exactly `(0, 1, 0)`, which Unity's player camera (forced Y-up) reads
+as a tilt.
+
+### Round 2 — `--flip z --cam-flip y`
+
+Hypothesis: same world flip as Round 1, but also flip the camera
+local Y axis to convert the OpenCV camera frame (Y-down) to a
+Unity-compatible camera frame (Y-up) when the viewer reads `traj.txt`.
+
+**Math:** points unchanged from Round 1; trajectory poses become
+`S_world · T · S_cam` with `S_world = diag(1, 1, -1, 1)` and
+`S_cam = diag(1, -1, 1, 1)`.
+
+**Result in Unity:** indistinguishable from Round 1 visually. The
+camera-frame flip only affected matrices Unity may or may not use for
+gizmos / initial pose; the *point geometry* (which is what the user
+sees) was identical to Round 1.
+
+**Why it failed:** same root cause as Round 1 (the world Y axis wasn't
+the data's true vertical).
+
+### Round 3 — `--upright` (auto-level using average camera-up)
+
+Hypothesis: the data's "true vertical" is the average of the three
+cameras' image-up axes (each photographer holds the camera roughly
+upright; individual rolls average out). After Round 1's `S_world`,
+that average is `(-0.26, 0.95, 0.22)` in viewer-world — close to Y
+but 18° off. Add a Rodrigues rotation that maps that average onto
+exactly `(0, 1, 0)`.
+
+**Math:** `p_view = R_upright · diag(1,1,-1) · T_cw · p_local`,
+trajectory poses get the same left-multiplication. Verified
+post-rotation that `mean(camera +Y_in_viewer) = (0, 1, 0)` to
+numerical precision, with cam2 at 2.3° from vertical and cam1/cam3 at
+~36° from vertical (their actual photographer roll).
+
+**Result in Unity:** see `debug2.png`. The scene was still tilted —
+visibly in the same fundamental direction as Round 1, even though the
+*math* said the average camera up was now exactly `+Y`. User reports:
+"I can't find a level angle no matter how I orbit." Looking at
+debug2.png, the three clouds also appear visually as separate-ish
+blobs from the orbiting angle the user happened to be at.
+
+**Why it failed:** averaging the camera-up axes turned out to be the
+*wrong way* to recover world vertical. The three cameras have
+substantially different rolls (51°, 16°, 24° in source space), so the
+average isn't a robust estimate of "up" — it's pulled by the
+asymmetry in the rolls. Worse, the resulting Rodrigues rotation also
+moves the points horizontally (off-axis rotation), not just
+de-tilts them. So instead of fixing the tilt, this rotated the whole
+world by 18° in a slightly different direction.
+
+### Round 4 — reset, re-examine source data from scratch
+
+User pushed back: "your plys are not creating the desired output, let's
+rethink from the original PLYs." Smart. We had been iterating on top
+of unverified assumptions for several rounds.
+
+User did the most informative thing we hadn't done: **loaded the
+ORIGINAL (un-transformed) PLYs + traj.txt into the Unity viewer**
+unchanged and screenshotted what the viewer naturally renders.
+
+`default_plys_intialview.png` (viewer at default spawn): empty sky +
+ground, no cloud visible. So the cloud isn't at Unity's origin.
+
+`default_plys.png` (user pressed S a few times to back away):
+a coherent panorama wedge appeared, visibly tilted relative to Unity's
+horizon. Crucially: ONE wedge, not three disconnected clouds — meaning
+**Unity *does* honour `traj.txt` and bakes cam→world** (this rules out
+the alternative "Unity dumps each PLY at origin in camera-local
+frame"). H1 was correct.
+
+In parallel I decoded `image{N}_rays.png` (which I had ignored until
+now). It's the per-pixel ray direction visualised as RGB:
+- R increases left→right → ray X component goes from negative to
+  positive ⇒ camera +X = image right.
+- G increases top→bottom → ray Y component negative→positive
+  ⇒ camera +Y = image down (so it IS OpenCV camera convention).
+- B dominantly high everywhere → ray Z positive ⇒ camera +Z =
+  forward.
+
+So the camera frame is unambiguously **OpenCV (X-right, Y-down,
+Z-forward)**.
+
+Then I rendered the data from **cam2's exact pose** (the
+photographer's POV, using cam2's pose to position the rendering
+camera). Result `/tmp/from_cam2_pose.png`: a clean panoramic stitch
+matching the assignment PDF's reference screenshot — light doorway top
+centre, cabinets middle, dark walls + the red chair from image3
+recognisable. **The data is correctly stitched in source world.**
+
+### What rounds 1–3 actually got wrong
+
+The room IS in source world space at world position `(4.5, -3.2, -1.4)`
+with the cameras facing **source -Z** direction. Unity's default user
+camera spawns near the world origin looking **+Z**. So out of the
+box (no transform), the user spawns far from the cloud, looking
+*away* from the panorama. Hence "I can't find a level view" — they
+were never looking at the room from inside; they were drifting around
+outside the wedge, viewing it edge-on.
+
+The transformation I'd been chasing wasn't a handedness fix or an
+upright rotation — those were red herrings. What we actually need is
+to **move the photographer's pose to Unity's spawn pose**: drop cam2
+at world origin, looking +Z, with up close to +Y. Then Unity's
+default user camera at `(0, 1, -10)` looking `+Z` lands right behind
+the photographer's eye and the panorama fills the screen.
+
+## 13. Round 5 — the actual fix
+
+Two operations on top of the cam→world bake:
+
+```
+S    = diag(1, 1, -1)                        # flip Z so cam-forward
+                                             # becomes Unity-forward
+delta = -(S · cam2_world_position)           # translate cam2 to origin
+
+For each point in image_i.ply:
+    p_view = S · T_cw_i · p_local + delta
+
+For each trajectory pose T_i (4x4):
+    T_i_view = T_translate · S_world · T_i
+    where T_translate is the 4x4 translation by delta
+          S_world is diag(1, 1, -1, 1)
+```
+
+This is just a **rigid relocation** of the photographer's coordinate
+system onto Unity's spawn. No axis swaps, no upright rotations, no
+camera-frame Y flip. Whatever roll cam2's photo has, the scene
+inherits — but cam2 has the smallest roll of the three (16°) and the
+photo itself shows shelves that are slightly tilted (consistent with
+that roll), so this is faithful to the source.
+
+The other two photos (cam1, cam3) will still appear rotated relative
+to cam2's panel, because the photographer *did* yaw between shots —
+that's expected and correct.
+
+### What about the handedness flip?
+
+Strictly speaking, source is RH and Unity is LH. But for pure point
+display (no shading, no mesh winding) handedness doesn't change the
+*visual* output: a point at `(x, y, z)` lands at the same screen
+coordinates whether the world is LH or RH. The Z negation in Round 5
+is **not** for handedness; it's purely to flip the *direction the
+cameras face* so that cam-forward becomes Unity-forward. Same
+operation, different motivation.
+
+### What changes in transform.py
+
+- Drop `--upright` entirely (it was actively harmful — see Round 3).
+- Drop `--cam-flip` (camera-frame flip doesn't affect point display
+  and conjugating the trajectory by it introduced unnecessary
+  complication).
+- Replace `--flip {x,y,z,none}` with a single hard-coded `S_z` flip
+  (the analysis above shows it's necessary).
+- Add `--center-on cam{1,2,3}` (default `cam2`) — picks which
+  camera's pose to drop at the world origin. Centring on cam2 is the
+  most natural choice because it has the smallest roll, but
+  if the viewer ever shows a cam2-roll that looks wrong, the user can
+  try `--center-on cam1` or `cam3`.
+
+### Verification before shipping
+
+Render the new output in Open3D from `(0, 1, -10) looking +Z`
+(Unity's default user-camera pose). If the panorama fills the
+viewport upright and recognisable, ship to the Windows laptop. If
+not, iterate locally on Mac before bothering the user with another
+upload round-trip.
