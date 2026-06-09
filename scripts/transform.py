@@ -69,6 +69,15 @@ def parse_args() -> argparse.Namespace:
         "opens. cam2 has the smallest natural roll, so it's the default.",
     )
     p.add_argument(
+        "--no-level",
+        action="store_true",
+        help="Skip the leveling rotation that aligns the anchor camera's "
+        "image-up axis with viewer +Y. By default we level (rotate about "
+        "the anchor's forward axis) so the scene appears upright. Disable "
+        "if you specifically want the anchor's natural photographer roll "
+        "preserved.",
+    )
+    p.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -161,17 +170,16 @@ def write_ply_ascii(
             f.write("".join(buf))
 
 
-def build_world_transform(
+def build_recentering_transform(
     poses: dict[int, np.ndarray], anchor_id: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (M_world_4x4, M_delta_translation) such that
+    """Return (S, T_delta) such that S @ T_anchor @ p_local + delta lands
+    the anchor camera's position at the world origin and its forward axis
+    along world +Z.
 
-        p_view = M_world @ p_source_world + delta
-
-    where M_world is diag(1, 1, -1, 1) and delta translates the anchor
-    camera's transformed world position to the origin.
-
-    Returns both as 4x4 matrices for ease of composition.
+    S = diag(1, 1, -1, 1) — flip Z so cam-forward becomes Unity-forward.
+    T_delta is a pure translation 4x4 so that the anchor's transformed
+    position is the origin.
     """
     S = np.diag([1.0, 1.0, -1.0, 1.0])
     anchor_T = poses[anchor_id]
@@ -183,25 +191,84 @@ def build_world_transform(
     return S, T_delta
 
 
+def compute_leveling_rotation(T_anchor_view: np.ndarray) -> tuple[np.ndarray, float]:
+    """Compute the 4x4 rotation about the anchor camera's forward axis
+    that maps the anchor's image-up axis exactly to viewer +Y.
+
+    The anchor's natural photographer roll (≈16° for cam2 in this
+    dataset) leaks into the scene as a world-level tilt — every wall
+    appears rolled by that amount because Unity's player camera is
+    locked to Y-up. This rotation cancels it *without* changing where
+    any camera looks: the rotation axis is the anchor's forward axis,
+    so cam2's view direction (and hence what appears in front of the
+    user at spawn) is identical before and after.
+
+    Implementation note: we use Rodrigues directly with the anchor's
+    forward axis as the rotation axis. We can't construct a "target
+    leveled frame" and take R_target @ R_current.T because after the
+    `S = diag(1,1,-1)` flip the camera triad becomes effectively
+    left-handed (right × down = -forward), and an RH cross product of
+    `down × forward` returns the wrong sign of `right`. Rodrigues
+    sidesteps that — it just rotates everything in the plane
+    perpendicular to forward by the signed roll angle.
+
+    Returns (R_level_4x4, roll_angle_degrees) for logging.
+    """
+    R_current = T_anchor_view[:3, :3]
+    forward = R_current[:, 2]
+    forward = forward / np.linalg.norm(forward)
+
+    # OpenCV col1 = image-down; image-up is its negation.
+    up_current = -R_current[:, 1]
+
+    world_up = np.array([0.0, 1.0, 0.0])
+    up_target_perp = world_up - np.dot(world_up, forward) * forward
+    norm = np.linalg.norm(up_target_perp)
+    if norm < 1e-6:
+        # Anchor is looking straight up or down; can't level about its
+        # forward axis. Skip.
+        return np.eye(4), 0.0
+    up_target = up_target_perp / norm
+
+    # Signed angle from up_current to up_target in the plane
+    # perpendicular to forward.
+    cos_a = float(np.clip(np.dot(up_current, up_target), -1.0, 1.0))
+    sin_a = float(np.dot(np.cross(up_current, up_target), forward))
+    angle = float(np.arctan2(sin_a, cos_a))
+
+    # Rodrigues rotation about `forward` by `angle`.
+    K = np.array(
+        [
+            [0.0, -forward[2], forward[1]],
+            [forward[2], 0.0, -forward[0]],
+            [-forward[1], forward[0], 0.0],
+        ]
+    )
+    R_level_3 = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+    R_level_4 = np.eye(4)
+    R_level_4[:3, :3] = R_level_3
+    return R_level_4, float(np.degrees(abs(angle)))
+
+
 def transform_cloud_points(
-    xyz_local: np.ndarray, T_cw: np.ndarray, S: np.ndarray, T_delta: np.ndarray
+    xyz_local: np.ndarray, T_cw: np.ndarray, M_world: np.ndarray
 ) -> np.ndarray:
-    """Apply the full pipeline: cam-local -> source-world -> Z-flipped ->
-    translated. Returns Nx3 float32 in viewer-world space."""
-    M = (T_delta @ S @ T_cw).astype(np.float64)
+    """Apply the full pipeline: cam-local -> source-world -> M_world.
+    M_world bundles S_z, T_delta, and (optionally) R_level. Returns Nx3
+    float32 in viewer-world space."""
+    M = (M_world @ T_cw).astype(np.float64)
     R = M[:3, :3]
     t = M[:3, 3]
     return (xyz_local.astype(np.float64) @ R.T + t).astype(np.float32)
 
 
-def transform_pose(
-    T_cw: np.ndarray, S: np.ndarray, T_delta: np.ndarray
-) -> np.ndarray:
+def transform_pose(T_cw: np.ndarray, M_world: np.ndarray) -> np.ndarray:
     """A camera pose stored in `traj.txt` lives in source-world space. We
     apply the SAME world transform on the left so the pose ends up in
     viewer-world. We deliberately do NOT touch the camera-local frame
     (right side) — see execute_plan.md sec 13 for why."""
-    return T_delta @ S @ T_cw
+    return M_world @ T_cw
 
 
 def main() -> int:
@@ -227,11 +294,27 @@ def main() -> int:
         print(f"ERROR: anchor {args.center_on!r} not in traj.txt", file=sys.stderr)
         return 2
 
-    S, T_delta = build_world_transform(poses, anchor_id)
+    S, T_delta = build_recentering_transform(poses, anchor_id)
     print(f"Anchor: cam{anchor_id} (source pos = {poses[anchor_id][:3,3].round(3).tolist()})")
-    print(f"Z flip + translate so cam{anchor_id} lands at world origin (0,0,0):")
+    print(f"Step 1 — Z flip + translate so cam{anchor_id} lands at world origin:")
     print(f"  S      = diag(1, 1, -1)")
     print(f"  delta  = {T_delta[:3, 3].round(3).tolist()}")
+
+    # Step 2 — level the anchor: rotate about the anchor's forward axis so
+    # its image-up axis maps exactly to viewer +Y. Without this, the
+    # anchor's natural photographer roll (e.g. 16° for cam2) shows up in
+    # Unity as a tilted scene the user can't level-orbit.
+    T_anchor_view_unleveled = T_delta @ S @ poses[anchor_id]
+    if args.no_level:
+        R_level = np.eye(4)
+        print(f"Step 2 — leveling DISABLED (--no-level)")
+    else:
+        R_level, roll = compute_leveling_rotation(T_anchor_view_unleveled)
+        print(f"Step 2 — level world about cam{anchor_id}'s forward axis "
+              f"(cancels {roll:.1f}° photographer roll):")
+        print(f"  R_level = \n{R_level[:3,:3].round(4)}")
+
+    M_world = R_level @ T_delta @ S
     print()
 
     new_poses: dict[int, np.ndarray] = {}
@@ -255,17 +338,18 @@ def main() -> int:
         print(f"  parsed {n} verts in {time.time()-t0:.1f}s")
 
         t1 = time.time()
-        xyz_view = transform_cloud_points(xyz, T_cw, S, T_delta)
+        xyz_view = transform_cloud_points(xyz, T_cw, M_world)
         print(
             f"  transformed in {time.time()-t1:.1f}s; "
             f"viewer bbox = [{xyz_view.min(axis=0).round(2).tolist()}"
             f" .. {xyz_view.max(axis=0).round(2).tolist()}]"
         )
 
+        level_tag = "" if args.no_level else f", leveled about cam{anchor_id} forward"
         comments = [
-            f"transformed by transform.py (--center-on cam{anchor_id})",
+            f"transformed by transform.py (--center-on cam{anchor_id}{level_tag})",
             f"source = {ply_in.name}",
-            "p_view = T_delta @ S_z @ T_cw @ p_local",
+            "p_view = R_level @ T_delta @ S_z @ T_cw @ p_local",
         ]
         t2 = time.time()
         write_ply_ascii(ply_out, xyz_view, rgb, comments=comments)
@@ -274,7 +358,7 @@ def main() -> int:
             f"in {time.time()-t2:.1f}s"
         )
 
-        new_poses[img_id] = transform_pose(T_cw, S, T_delta)
+        new_poses[img_id] = transform_pose(T_cw, M_world)
 
     traj_out = out / "traj.txt"
     write_traj(traj_out, new_poses)

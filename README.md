@@ -133,31 +133,39 @@ Viewer controls (from the assignment PDF):
 ## 5. Approach (one-paragraph version)
 
 The three PLYs are dense, single-image-derived point clouds in their
-respective camera-local frames; `traj.txt` gives the camera-to-world pose
-for each. The viewer expects every PLY to already be in *world*
-coordinates. With `S = diag(1, 1, -1)` (flip world Z so cam-forward
-becomes Unity-forward `+Z`) and `delta = -(S · cam2_world_pos)` (translate
-so the middle photographer's pose lands at the world origin):
+respective camera-local frames; `traj.txt` gives the camera-to-world
+pose for each. The viewer expects every PLY in *world* coordinates.
+Three operations on top of the cam→world bake:
 
 ```
-p_view = S · T_cw · p_local + delta              # per point cloud
-T_view = T_translate(delta) · S_world · T_cw     # per trajectory pose
+S           = diag(1, 1, -1)          # flip Z so cam-forward = Unity +Z
+delta       = -(S · cam2_world_pos)   # translate cam2 to origin
+R_level     = Rodrigues(axis=cam2_forward, angle=cam2_roll)
+                                      # rotate about cam2 forward to
+                                      # cancel cam2's photographer roll
+M_world     = R_level · T_translate(delta) · S
+
+p_view = M_world · T_cw · p_local              # per point cloud
+T_view = M_world · T_cw                        # per trajectory pose
 ```
 
-Cam2 ends up at world origin looking `~+Z`, so Unity's default user
-camera at `(0, 1, -10)` looking `+Z` spawns right behind the
-photographer's eye and the panorama fills the view with no flying
-required. We picked cam2 as the anchor because it has the smallest
-natural photographer roll (16°) of the three. Full reasoning, including
-the four earlier approaches that didn't work and the reset that led
-here, is in [`execute_plan.md`](./execute_plan.md) §12–§13.
+Cam2 ends up at world origin looking `+Z`, image-up exactly `+Y`, so
+Unity's default user camera at `(0, 1, -10)` looking `+Z` spawns
+behind cam2 with the panorama upright and filling the view. Cam2 is
+the anchor because it has the smallest natural roll (16°) of the
+three; the leveling cancels even that. The other two cameras keep
+their own photographer rolls (51° for cam1, 23° for cam3) — those
+are real properties of the source photos. Full reasoning, including
+the five earlier approaches that didn't work and what each taught us,
+is in [`execute_plan.md`](./execute_plan.md) §12–§14.
 
 ## 5a. CLI knobs
 
 ```bash
-python scripts/transform.py                  # default: anchor cam2
-python scripts/transform.py --center-on cam1 # try cam1 as the anchor
-python scripts/transform.py --center-on cam3 # try cam3 as the anchor
+python scripts/transform.py                  # default: anchor cam2, leveled
+python scripts/transform.py --center-on cam1 # anchor on cam1 instead
+python scripts/transform.py --center-on cam3 # anchor on cam3 instead
+python scripts/transform.py --no-level       # skip the leveling rotation
 python scripts/transform.py --limit 100000   # smoke test on a small subset
 ```
 

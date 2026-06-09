@@ -636,6 +636,61 @@ is **not** for handedness; it's purely to flip the *direction the
 cameras face* so that cam-forward becomes Unity-forward. Same
 operation, different motivation.
 
+## 14. Round 6 — add leveling about the anchor's forward axis
+
+User tested Round 5 output in the Unity viewer and screenshotted
+`9june_debug.png`. The panorama appeared but **rolled ~30°
+clockwise** — visibly the same wood door, dark wall, cabinets, chair
+content as the PDF reference, just tilted as a whole. The PDF
+reference shows the panorama perfectly horizontal.
+
+**Root cause:** anchoring on cam2 puts cam2 at origin looking +Z, but
+cam2's *image-up axis* still carries the photographer's natural 16°
+roll. Without compensation, that roll becomes the world's tilt — and
+Unity's player camera is locked to world +Y as up, so the user can't
+orbit to a level view.
+
+**Fix:** add a rotation `R_level` that maps cam2's image-up axis
+exactly to viewer `+Y`. The rotation axis is cam2's forward axis (so
+cam2 still looks in the same direction; the user still spawns staring
+at cam2's panel) and the angle is the signed roll.
+
+**Why this isn't Round 3's mistake again:** Round 3 averaged the
+image-up axes of *all three cameras* and rotated to that average.
+That was wrong because cam1 has 51°, cam2 has 16°, cam3 has 23° roll,
+and the average isn't a meaningful "world up" estimate. Round 6
+levels against **one specific anchor (cam2)** and only rotates about
+that anchor's *forward axis* (preserving the look direction).
+
+**Math:**
+
+```
+forward    = (R_anchor @ S_z) column 2                # in viewer space
+up_current = -(R_anchor @ S_z) column 1               # OpenCV image-up
+up_target  = ((0,1,0) - dot((0,1,0), forward) * forward) normalised
+angle      = signed angle from up_current to up_target in
+             the plane perpendicular to forward
+R_level    = Rodrigues(axis=forward, angle=angle)
+M_world    = R_level @ T_delta @ S_z
+```
+
+**Implementation note:** we don't construct R_level as
+`R_target_frame @ R_current_frame.T`, because the `S_z` flip turns
+the camera triad into an effectively left-handed system
+(`right × down = -forward` instead of `+forward`), and a vanilla RH
+cross product to build `right_target = down_target × forward` returns
+the wrong sign. Rodrigues directly sidesteps that — it just rotates
+points by `angle` in the plane perpendicular to `forward`, no triad
+reconstruction needed.
+
+**Verified post-leveling:** cam2 up = `(0.01, 0.985, -0.171)` (Y
+dominates, no residual roll). cam1 still has Y=0.816 in its up axis
+and cam3 has Y=0.746 — that's the *individual* roll those
+photographers used for those specific shots, which is faithful to the
+source. The world as a whole is upright.
+
+**CLI:** leveling is now default; pass `--no-level` to disable.
+
 ### What changes in transform.py
 
 - Drop `--upright` entirely (it was actively harmful — see Round 3).
