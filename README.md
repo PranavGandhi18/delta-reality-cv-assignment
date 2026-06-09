@@ -133,39 +133,38 @@ Viewer controls (from the assignment PDF):
 ## 5. Approach (one-paragraph version)
 
 The three PLYs are dense, single-image-derived point clouds in their
-respective camera-local frames; `traj.txt` gives the camera-to-world pose for
-each. The viewer expects every PLY to already be in *world* coordinates. On
-top of that, the source pipeline is right-handed (OpenCV / COLMAP camera
-convention) while the Unity viewer is left-handed (Y-up, Z-forward). So the
-correction is, with `S_world = diag(1, 1, -1, 1)` and `S_cam = diag(1, -1, 1, 1)`:
+respective camera-local frames; `traj.txt` gives the camera-to-world pose
+for each. The viewer expects every PLY to already be in *world*
+coordinates. With `S = diag(1, 1, -1)` (flip world Z so cam-forward
+becomes Unity-forward `+Z`) and `delta = -(S · cam2_world_pos)` (translate
+so the middle photographer's pose lands at the world origin):
 
 ```
-p_view = S_world · T_cw · p_local            # per point cloud
-T_view = S_world · T_cw · S_cam              # per trajectory pose
+p_view = S · T_cw · p_local + delta              # per point cloud
+T_view = T_translate(delta) · S_world · T_cw     # per trajectory pose
 ```
 
-`S_world` flips world handedness (negate Z); `S_cam` converts the camera
-frame from OpenCV (Y-down) to Unity (Y-up). Points only need `S_world`
-because they're already in source-camera coordinates; the trajectory matrix
-needs both because it terminates in a camera frame the viewer will
-interpret. Full reasoning, including how we verified handedness
-experimentally and the visual sanity checks done on macOS, is in
-[`execute_plan.md`](./execute_plan.md).
+Cam2 ends up at world origin looking `~+Z`, so Unity's default user
+camera at `(0, 1, -10)` looking `+Z` spawns right behind the
+photographer's eye and the panorama fills the view with no flying
+required. We picked cam2 as the anchor because it has the smallest
+natural photographer roll (16°) of the three. Full reasoning, including
+the four earlier approaches that didn't work and the reset that led
+here, is in [`execute_plan.md`](./execute_plan.md) §12–§13.
 
-## 5a. CLI knobs for fallback hypotheses
-
-If the viewer renders the scene wrong, try these without editing code:
+## 5a. CLI knobs
 
 ```bash
-python scripts/transform.py --flip none      # source was already LH
-python scripts/transform.py --flip y         # the up-axis is different
-python scripts/transform.py --cam-flip none  # source camera was already Y-up
-python scripts/transform.py --binary         # smaller / faster PLY output
+python scripts/transform.py                  # default: anchor cam2
+python scripts/transform.py --center-on cam1 # try cam1 as the anchor
+python scripts/transform.py --center-on cam3 # try cam3 as the anchor
 python scripts/transform.py --limit 100000   # smoke test on a small subset
 ```
 
-`scripts/visualize.py` renders XY/XZ/YZ orthographic projections of the
-output (or `--src` for the originals) into `data/output/preview_*.png`.
+Output is always ASCII PLY (matching the source format exactly, ~114 MB
+each). `scripts/visualize.py` renders XY/XZ/YZ orthographic projections
+into `data/output/preview_*.png`. `scripts/preview_o3d.py` opens an
+interactive Open3D window from any OS.
 
 ## 6. References
 

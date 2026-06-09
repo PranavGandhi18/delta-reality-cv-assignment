@@ -139,8 +139,12 @@ Concrete steps, in order:
    - Reads each PLY (streaming, since they're ~125 MB ASCII).
    - For each point: `p_world = T_cw · p_cam`, then apply handedness flip
      `S = diag(1, -1, 1)` (best guess for OpenCV→Unity).
-   - Writes new binary-little-endian PLY to `data/output/imageN.ply` to keep
-     file size down (the viewer should accept both ASCII and binary — verify).
+   - Writes new ASCII PLY to `data/output/imageN.ply` matching the
+     source's exact layout, so the viewer's PLY parser sees a familiar
+     format. (We considered binary_little_endian for size, but the user
+     can upload the ASCII files to Google Drive without trouble, and the
+     viewer's parser tolerance is unknown — so ASCII is the safer
+     default.)
    - Writes `data/output/traj.txt` with each pose mapped through the same
      handedness conjugation: `T'_cw = S · T_cw · S` (and the camera rotation
      itself goes through the OpenCV→Unity camera-axis flip).
@@ -319,17 +323,18 @@ viewer specifically does with the matrix (gizmo orientation, initial
 camera pose). The user will need to launch the Linux build to confirm
 the final visual.
 
-## 8. Output format choice (ASCII vs. binary PLY)
+## 8. Output format choice — ASCII PLY only
 
-The originals are ASCII PLY (~125 MB each, slow to load). Most PLY readers
-accept either, but custom Unity loaders are sometimes ASCII-only. To
-minimise risk of the viewer choking on our output, **we emit ASCII PLY
-matching the original layout**: `x y z r g b` per line, with `float` for
-position and `uchar` for color. We keep ~6 decimal places — enough to
-preserve mm precision at the scene's scale and roughly match the source.
-The `transform.py` script also supports `--binary` to emit binary
-little-endian PLY for users who care more about load time than parser
-compatibility.
+The originals are ASCII PLY (~125 MB each). We emit ASCII PLY matching
+the original layout: `x y z r g b` per line, with `float` for position
+and `uchar` for color. ~6 decimal places — enough to preserve mm
+precision at the scene's scale and roughly match the source.
+
+We dropped an earlier `--binary` option (would have produced ~44 MB
+binary_little_endian PLYs, ~3× smaller). The user confirmed Google
+Drive uploads the ~114 MB ASCII files fine, so the binary path added
+risk (custom Unity loaders are sometimes ASCII-only) without enough
+benefit to keep around.
 
 ## 9. What to do if the result looks wrong in the viewer
 

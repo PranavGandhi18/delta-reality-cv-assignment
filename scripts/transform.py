@@ -24,7 +24,6 @@ viewer.
 
 Run (from repo root):
     python scripts/transform.py
-    python scripts/transform.py --binary           # smaller binary PLY
     python scripts/transform.py --center-on cam1   # try a different anchor
     python scripts/transform.py --limit 100000     # smoke test on a subset
 """
@@ -68,12 +67,6 @@ def parse_args() -> argparse.Namespace:
         "Unity's default user camera spawns near origin looking +Z, so the "
         "anchor camera defines what the user will see when the viewer "
         "opens. cam2 has the smallest natural roll, so it's the default.",
-    )
-    p.add_argument(
-        "--binary",
-        action="store_true",
-        help="Emit binary little-endian PLY (smaller / faster). Default is "
-        "ASCII to match the source format exactly.",
     )
     p.add_argument(
         "--limit",
@@ -166,46 +159,6 @@ def write_ply_ascii(
             for (x, y, z), (r, g, b) in zip(xs, cs):
                 buf.append(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
             f.write("".join(buf))
-
-
-def write_ply_binary(
-    path: Path, xyz: np.ndarray, rgb: np.ndarray, *, comments: list[str] | None = None
-) -> None:
-    n = xyz.shape[0]
-    with open(path, "wb") as f:
-        f.write(b"ply\n")
-        f.write(b"format binary_little_endian 1.0\n")
-        if comments:
-            for c in comments:
-                for line in c.splitlines():
-                    f.write(f"comment {line}\n".encode("utf-8"))
-        f.write(f"element vertex {n}\n".encode("utf-8"))
-        f.write(b"property float x\n")
-        f.write(b"property float y\n")
-        f.write(b"property float z\n")
-        f.write(b"property uchar red\n")
-        f.write(b"property uchar green\n")
-        f.write(b"property uchar blue\n")
-        f.write(b"end_header\n")
-
-        dt = np.dtype(
-            [
-                ("x", "<f4"),
-                ("y", "<f4"),
-                ("z", "<f4"),
-                ("r", "u1"),
-                ("g", "u1"),
-                ("b", "u1"),
-            ]
-        )
-        arr = np.empty(n, dtype=dt)
-        arr["x"] = xyz[:, 0]
-        arr["y"] = xyz[:, 1]
-        arr["z"] = xyz[:, 2]
-        arr["r"] = rgb[:, 0]
-        arr["g"] = rgb[:, 1]
-        arr["b"] = rgb[:, 2]
-        f.write(arr.tobytes(order="C"))
 
 
 def build_world_transform(
@@ -315,10 +268,7 @@ def main() -> int:
             "p_view = T_delta @ S_z @ T_cw @ p_local",
         ]
         t2 = time.time()
-        if args.binary:
-            write_ply_binary(ply_out, xyz_view, rgb, comments=comments)
-        else:
-            write_ply_ascii(ply_out, xyz_view, rgb, comments=comments)
+        write_ply_ascii(ply_out, xyz_view, rgb, comments=comments)
         print(
             f"  wrote {ply_out} ({os.path.getsize(ply_out)/1e6:.1f} MB) "
             f"in {time.time()-t2:.1f}s"
