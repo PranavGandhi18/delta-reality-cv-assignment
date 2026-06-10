@@ -691,6 +691,50 @@ source. The world as a whole is upright.
 
 **CLI:** leveling is now default; pass `--no-level` to disable.
 
+## 15. Round 7 — switch anchor to cam1 since viewer uses traj.txt[0] for spawn
+
+User tested Round 6 output (anchor=cam2, leveled) in the Unity viewer.
+Result `10june_debug.png`: the panorama appeared but still rolled
+~30–45° clockwise. Same content as before, same kind of tilt.
+
+**Root cause hypothesis:** The Unity viewer appears to read
+`traj.txt` row 1 (= cam1) as the **initial user-camera pose**. Round 6
+anchored on **cam2**, so cam2 became upright at origin, but cam1's
+pose (row 1) still carried cam1's natural 51° roll minus the
+16° leveling = **35° residual roll**. Whatever pose the viewer reads
+from row 1, that's what the user spawns at, and they see the scene
+through cam1's tilted frame.
+
+**Evidence supporting this hypothesis:** the visible tilt in
+`10june_debug.png` is roughly 35°, matching the residual roll
+prediction. The depth-tail of image1's far points extends to the
+upper-right, exactly the direction cam1 (post-leveling-of-cam2)
+would be rolled.
+
+**Round 7 fix:** switch `--center-on` default from `cam2` to `cam1`.
+Anchor cam1 at origin, level about its forward axis. After this,
+cam1's image-up = `(0.007, 0.998, -0.068)` — perfectly upright. The
+user spawns upright looking through cam1's view direction (the
+doorway with workspace beyond).
+
+**Trade-off cam2 and cam3 carry:** their relative rolls to cam1
+become absolute world rolls. Specifically:
+- cam2: 16° in source + (-)51° leveling = ~35° residual roll
+- cam3: -23° in source + (-)51° leveling = ~74° residual roll
+  (very rolled when viewed)
+
+So if the user pans right to see cam2's content (shelves) or cam3's
+content (corner), those panels will appear visibly tilted. This is
+unavoidable: the three cameras had genuinely different physical rolls
+in the source photos, and no single rotation can level all three at
+once. The PDF reference might be a different dataset where all
+photographers' rolls were similar — for THIS dataset, we have to pick
+which panel to put upright at spawn.
+
+**If the assessor cares about a non-tilted *cam2* or *cam3* view
+instead,** the user can rerun with `python scripts/transform.py
+--center-on cam2` or `--center-on cam3`.
+
 ### What changes in transform.py
 
 - Drop `--upright` entirely (it was actively harmful — see Round 3).

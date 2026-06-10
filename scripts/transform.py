@@ -62,11 +62,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--center-on",
         choices=("cam1", "cam2", "cam3"),
-        default="cam2",
+        default="cam1",
         help="Which camera's transformed pose to drop at the world origin. "
-        "Unity's default user camera spawns near origin looking +Z, so the "
-        "anchor camera defines what the user will see when the viewer "
-        "opens. cam2 has the smallest natural roll, so it's the default.",
+        "The Unity viewer here uses traj.txt row 1 (= cam1) as the initial "
+        "user-camera pose, so cam1 is the right anchor. Switching to "
+        "cam2/cam3 lets the user manually try other spawn cameras if needed.",
     )
     p.add_argument(
         "--no-level",
